@@ -3,9 +3,12 @@ import requests
 import bs4
 import time
 import datetime
+import os
+
 import pandas as pd
 import seaborn as sns
-import os
+import matplotlib.pyplot as plt
+import numpy as np
 
 URL_BASE = "https://www.borsaitaliana.it"
 URL_BONDS_TEMPLATE = "/borsa/obbligazioni/mot/{}/lista.html?lang=en&page="
@@ -21,7 +24,7 @@ BACKOFF_TIME = 0.5
 
 
 def get_timestamp():
-    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.")
+    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def mk_save_path():
@@ -68,9 +71,13 @@ def get_btp_info(btp_url):
 
 def get_bonds_info(bonds):
     infos = []
-    for i, btp_url in enumerate(bonds["url"].to_list()):
-        print(i, btp_url)
-        infos.append(get_btp_info(btp_url))
+    urls = bonds["url"].to_list()
+    for i, btp_url in enumerate(urls):
+        print(f"{i:04}/{len(urls):04}", btp_url)
+        try:
+            infos.append(get_btp_info(btp_url))
+        except Exception as e:
+            print(f"Error: {e}")
         time.sleep(BACKOFF_TIME)
     return pd.DataFrame(infos)
 
@@ -123,58 +130,68 @@ def clean_df(df):
         df[c] = pd.to_datetime(df[c], format="%y/%m/%d")
 
     df["Reference price date"] = pd.to_datetime(
-        df["Reference price date"], format="%Y/%m/%d"
+        df["Reference price date"], format="%d/%m/%Y"
     )
     return df
 
 
+def posix_timestamp_to_str(x):
+    return datetime.datetime.fromtimestamp(x).strftime("%Y-%m")
+
+
 if __name__ == "__main__":
-    timestamp = get_timestamp()
-    mk_save_path()
+    # timestamp = get_timestamp()
+    # mk_save_path()
     # STEP 1: get list of bonds
-    bond_ls_df = get_all_bonds()
-    bond_ls_df.to_csv(f"{SAVE_PATH}/{timestamp}-bond-lists.csv", index=False)
+    # bond_ls_df = get_all_bonds()
+    # bond_ls_df.to_csv(f"{SAVE_PATH}/{timestamp}-bond-lists.csv", index=False)
     # STEP 2: get data for each bond
-    bonds_df = get_bonds_info(bond_ls_df)
-    bonds_df.to_csv(f"{SAVE_PATH}/{timestamp}-bonds-raw.csv", index=False)
+    # bonds_df = get_bonds_info(bond_ls_df)
+    # bonds_df.to_csv(f"{SAVE_PATH}/{timestamp}-bonds-raw.csv", index=False)
     #####################################################
     # STEP 3: data analysis
-    # bonds_df = pd.read_csv("./data/.csv")
-    # df = clean_df(bonds_df)
-    # df["Emittente"] = df["Emittente"].str.lower()
-    # df = df[df["Valuta di Negoziazione/ Liquidazione"] == "EUR/EUR"]
-    # df = df[df["Tipologia"].str.contains("stato").fillna(False)]
-    # df = df[df["Struttura Bond"] == "Plain Vanilla"]
-    # df = df[
-    #     (df["Emittente"] == "ministero dell'economia e delle finanze")
-    #     | (df["Emittente"].str.contains("aus"))
-    #     | (df["Emittente"].str.contains("bel"))
-    #     | (df["Emittente"].str.contains("fra"))
-    #     | (df["Emittente"].str.contains("ted"))
-    #     | (df["Emittente"].str.contains("ola"))
-    # ]
+    bonds_df = pd.read_csv("./data/2023-04-07_10-15-04-bonds-raw.csv")
+    df = clean_df(bonds_df)
 
-    # df["Scadenza"] = pd.to_datetime(df["Scadenza"], format="%Y-%m-%d", errors="coerce")
-    # df = df[df["Scadenza"] > datetime.datetime.now()]
-    # df = df.sort_values("Scadenza")
+    # Do not want exchange rate risk
+    df = df[df["Negotiation Currency/ Settlement currency"] == "EUR/EUR"]
 
-    # df2 = df
-    # df2["maxTRESnetto"] = df2.groupby("Emittente")[
-    #     "Rendimento effettivo a scadenza netto"
-    # ].transform(lambda x: x.cummax())
-    # df2 = df2[df2["maxTRESnetto"] == df2["Rendimento effettivo a scadenza netto"]]
+    # Just interested in Public Debt Bonds
+    df = df[df["Tipology"].isin(["Italian Government Bonds", "Foreign Public Debt"])]
 
-    # sns.lineplot(
-    #     data=df2, x="Scadenza", y="maxTRESnetto", hue="Emittente",
-    # )
-    # ax = sns.scatterplot(
-    #     data=df,
-    #     x="Scadenza",
-    #     y="Rendimento effettivo a scadenza netto",
-    #     hue="Emittente",
-    #     hue_order=df2["Emittente"].unique(),
-    #     s=100,
-    # )
-    # df2.apply(
-    #     lambda x: ax.text(x["Scadenza"], x["maxTRESnetto"], x["Codice Isin"]), axis=1
-    # )
+    # Consider just Plain Vanilla to remove other external variables
+    df = df[df["Bond Structure"] == "Plain Vanilla"]
+
+    # Get the county and filter
+    df["Country"] = df["Isin Code"].apply(lambda x: x[:2])
+    df = df[df["Country"].isin(["IT", "AT", "BE", "DE", "FI", "FR", "NL"])]
+
+    # Plot the envelope of the maximum Net yield to maturity
+    df = df.sort_values("Expiry Date")
+    df = df[df["Expiry Date"] > datetime.datetime.now()]
+    df["ExpiryTimestamp"] = df["Expiry Date"].apply(lambda x: x.timestamp())
+    df["maxNTM"] = df.groupby("Country")["Net yield to maturity"].apply(
+        lambda x: x.cummax()
+    )
+    df2 = df[df["maxNTM"] == df["Net yield to maturity"]]
+
+    sns.lmplot(
+        data=df,
+        x="ExpiryTimestamp",
+        y="Net yield to maturity",
+        hue="Country",
+        hue_order=df2["Country"].unique(),
+        lowess=True,
+        line_kws={"alpha": 0.3, "linewidth": 5},
+    )
+    ax = plt.gca()
+    sns.lineplot(
+        data=df2, x="ExpiryTimestamp", y="maxNTM", hue="Country", ax=ax, legend=False
+    )
+    df2.apply(
+        lambda x: ax.text(x["ExpiryTimestamp"], x["maxNTM"], x["Isin Code"]), axis=1
+    )
+    xticks = np.linspace(df["ExpiryTimestamp"].min(), df["ExpiryTimestamp"].max(), 10)
+    ax.set_xticks(xticks)
+
+    ax.set_xticklabels([posix_timestamp_to_str(x) for x in xticks])
